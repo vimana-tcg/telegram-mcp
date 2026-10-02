@@ -138,28 +138,116 @@ async def make_call(
 
 
 
-# --- Live two-way conversation, bridged to an ElevenLabs conversational agent ---
+# --- Live two-way conversation: OpenAI ears, Claude brain, ElevenLabs/OpenAI mouth ---
 
-_TALK_RATE = 48000  # agent is configured for pcm_48000 in and out, same as the call
-_TALK_FRAME_BYTES = _TALK_RATE // 100 * 2  # 10 ms of mono s16le
+_TALK_RATE = 48000  # call audio: 48 kHz mono s16le
+_TALK_FRAME_BYTES = _TALK_RATE // 100 * 2  # 10 ms
 _TALK_SILENCE = b"\x00" * _TALK_FRAME_BYTES
+_TALK_END_MARK = "[КОНЕЦ]"
+_TALK_MODEL = os.environ.get("TALK_CALL_LLM", "claude-sonnet-5-5")
 
 
-async def _elevenlabs_signed_url() -> str:
-    import httpx
+def _rms(pcm: bytes) -> float:
+    from array import array
 
-    api_key = os.environ.get("ELEVENLABS_API_KEY", "")
-    agent_id = os.environ.get("ELEVENLABS_CALL_AGENT_ID", "")
-    if not api_key or not agent_id:
-        raise RuntimeError("ELEVENLABS_API_KEY / ELEVENLABS_CALL_AGENT_ID are not set")
-    async with httpx.AsyncClient(timeout=20) as http:
-        resp = await http.get(
-            "https://api.elevenlabs.io/v1/convai/conversation/get-signed-url",
-            params={"agent_id": agent_id},
-            headers={"xi-api-key": api_key},
+    samples = array("h", pcm)
+    if not samples:
+        return 0.0
+    return (sum(x * x for x in samples) / len(samples)) ** 0.5
+
+
+def _upsample_2x(pcm24: bytes) -> bytes:
+    """24 kHz -> 48 kHz by sample doubling (fine for speech)."""
+    from array import array
+
+    src = array("h", pcm24[: len(pcm24) // 2 * 2])
+    out = array("h", bytes(len(src) * 4))
+    out[0::2] = src
+    out[1::2] = src
+    return out.tobytes()
+
+
+def _wav_bytes(pcm: bytes) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(_TALK_RATE)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _talk_prompt(goal: str) -> str:
+    return (
+        "Ты — голосовой ИИ-помощник Михаила Корогодского и сейчас говоришь по телефону (Telegram-звонок) от его имени. "
+        "Твои ответы озвучиваются голосом, поэтому: только разговорная речь, без списков, эмодзи и markdown; "
+        "одна-две короткие фразы за раз, как живой человек по телефону. Говори по-русски. "
+        "Если спросят, кто ты, честно скажи, что ты ИИ-помощник Михаила. "
+        "Ничего не обещай от имени Михаила (деньги, сроки, решения) — скажи, что передашь ему. "
+        "Реплики собеседника приходят из распознавания речи и могут быть с ошибками — понимай по смыслу. "
+        f"Когда цель достигнута или собеседник прощается, попрощайся и добавь в самом конце {_TALK_END_MARK}.\n\n"
+        f"Цель этого звонка: {goal}"
+    )
+
+
+async def _transcribe(http, pcm: bytes) -> str:
+    resp = await http.post(
+        "https://api.openai.com/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+        data={"model": "gpt-4o-transcribe", "language": "ru"},
+        files={"file": ("speech.wav", _wav_bytes(pcm), "audio/wav")},
+    )
+    resp.raise_for_status()
+    return (resp.json().get("text") or "").strip()
+
+
+async def _think(http, system: str, history: list) -> str:
+    resp = await http.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+            "anthropic-version": "2023-06-01",
+        },
+        json={"model": _TALK_MODEL, "max_tokens": 300, "system": system, "messages": history},
+    )
+    resp.raise_for_status()
+    return "".join(b.get("text", "") for b in resp.json().get("content", [])).strip()
+
+
+async def _speak(http, text: str, voice: str, sink, interrupted: asyncio.Event) -> None:
+    """Stream TTS (24 kHz PCM) into `sink` as 48 kHz, stopping on barge-in."""
+    if voice == "robot":
+        req = http.stream(
+            "POST",
+            "https://api.openai.com/v1/audio/speech",
+            headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+            json={"model": "gpt-4o-mini-tts", "voice": "onyx", "input": text, "response_format": "pcm"},
         )
+    else:
+        req = http.stream(
+            "POST",
+            f"https://api.elevenlabs.io/v1/text-to-speech/{os.environ['ELEVENLABS_VOICE_ID']}/stream",
+            params={"output_format": "pcm_24000"},
+            headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
+            json={
+                "text": text,
+                "model_id": "eleven_flash_v2_5",
+                "voice_settings": {"stability": 0.72, "similarity_boost": 0.8, "style": 0.15},
+            },
+        )
+    tail = b""
+    async with req as resp:
         resp.raise_for_status()
-        return resp.json()["signed_url"]
+        async for chunk in resp.aiter_bytes():
+            if interrupted.is_set():
+                return
+            chunk = tail + chunk
+            cut = len(chunk) // 2 * 2
+            tail = chunk[cut:]
+            sink.extend(_upsample_2x(chunk[:cut]))
 
 
 @mcp.tool(
@@ -171,29 +259,28 @@ async def talk_call(
     user_id: Union[int, str],
     goal: str,
     first_message: str = "Алло, привет!",
+    voice: str = "clone",
     ring_timeout: int = 45,
     max_seconds: int = 300,
     account: str = None,
 ) -> str:
     """
-    Call a user and hold a live voice conversation via an ElevenLabs agent.
+    Call a user and hold a live voice conversation about `goal`.
 
-    The agent speaks in the configured cloned voice and follows `goal`
-    (what to find out / say). Returns the conversation transcript.
+    Speech recognition: OpenAI. Replies: Claude. Voice: the cloned ElevenLabs
+    voice ("clone") or a stock OpenAI voice ("robot"). Returns the transcript.
     Only users listed in TELEGRAM_CALL_ALLOWED_USER_IDS can be called.
 
     Args:
         user_id: Target user id or username.
         goal: Instructions for this call (who is called, what to find out).
-        first_message: First phrase the agent says when the user answers.
+        first_message: First phrase said when the user answers.
+        voice: "clone" (founder's cloned voice) or "robot" (stock voice).
         ring_timeout: Seconds to wait for the user to answer (10-90).
         max_seconds: Hard limit on conversation length (30-900).
     """
     try:
-        import base64
-        import json as _json
-
-        import websockets
+        import httpx
         from pytgcalls import filters as call_filters
         from pytgcalls.exceptions import CallBusy, CallDeclined, CallDiscarded, TimedOutAnswer
         from pytgcalls.types import (
@@ -208,10 +295,18 @@ async def talk_call(
         )
         from pytgcalls.types.raw import AudioParameters
 
+        if voice not in ("clone", "robot"):
+            return 'voice must be "clone" or "robot".'
         if not 10 <= ring_timeout <= 90:
             return "ring_timeout must be between 10 and 90 seconds."
         if not 30 <= max_seconds <= 900:
             return "max_seconds must be between 30 and 900 seconds."
+        needed = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+        if voice == "clone":
+            needed += ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"]
+        missing = [k for k in needed if not os.environ.get(k)]
+        if missing:
+            return f"Missing env: {', '.join(missing)}"
 
         cl = get_client(account)
         await ensure_connected(cl)
@@ -221,15 +316,13 @@ async def talk_call(
         if user.id not in _CALL_ALLOWED_USER_IDS:
             return f"User {user.id} is not in TELEGRAM_CALL_ALLOWED_USER_IDS; call refused."
 
-        signed_url = await _elevenlabs_signed_url()
-
         if _call_lock.locked():
             return "Another call is in progress; try again later."
         async with _call_lock:
             engine = await _get_call_engine(account or "default", cl)
             params = AudioParameters(_TALK_RATE, 1)
             hung_up = asyncio.Event()
-            incoming: asyncio.Queue = asyncio.Queue(maxsize=500)
+            incoming: asyncio.Queue = asyncio.Queue(maxsize=3000)
             outgoing = bytearray()
             transcript: list = []
             end_reason = {"value": "max_seconds reached"}
@@ -267,96 +360,108 @@ async def talk_call(
                 return f"Call to {user.id} was discarded before it connected."
 
             started = time.monotonic()
+            utterances: asyncio.Queue = asyncio.Queue()
+            interrupted = asyncio.Event()
+            finished = asyncio.Event()
+            system = _talk_prompt(goal)
+            history = [{"role": "user", "content": "(собеседник взял трубку)"}]
+
+            async def _speaker():
+                # outgoing buffer -> call, paced in real time, 10 ms frames
+                tick = time.monotonic()
+                while True:
+                    if len(outgoing) >= _TALK_FRAME_BYTES:
+                        chunk = bytes(outgoing[:_TALK_FRAME_BYTES])
+                        del outgoing[:_TALK_FRAME_BYTES]
+                    else:
+                        chunk = _TALK_SILENCE
+                    await engine.send_frame(user.id, Device.MICROPHONE, chunk)
+                    tick += 0.01
+                    await asyncio.sleep(max(0.0, tick - time.monotonic()))
+
+            async def _listener():
+                # energy VAD: split incoming audio into utterances
+                buf = bytearray()
+                speech, pre, silence_ms, voiced_ms = bytearray(), [], 0, 0
+                noise = 300.0
+                in_speech = False
+                while True:
+                    buf += await incoming.get()
+                    while len(buf) >= _TALK_FRAME_BYTES:
+                        frame = bytes(buf[:_TALK_FRAME_BYTES])
+                        del buf[:_TALK_FRAME_BYTES]
+                        level = _rms(frame)
+                        loud = level > max(500.0, noise * 3)
+                        if not in_speech and not loud:
+                            noise = noise * 0.98 + level * 0.02
+                        if not in_speech:
+                            pre.append(frame)
+                            pre = pre[-25:]  # 250 ms pre-roll
+                            voiced_ms = voiced_ms + 10 if loud else 0
+                            if voiced_ms >= 60:
+                                in_speech, silence_ms = True, 0
+                                speech = bytearray(b"".join(pre))
+                                if len(outgoing) > _TALK_FRAME_BYTES * 30:
+                                    interrupted.set()  # barge-in: stop talking
+                                    outgoing.clear()
+                        else:
+                            speech += frame
+                            silence_ms = 0 if loud else silence_ms + 10
+                            if silence_ms >= 700 or len(speech) > _TALK_FRAME_BYTES * 2000:
+                                in_speech, voiced_ms = False, 0
+                                if len(speech) >= _TALK_FRAME_BYTES * 40:
+                                    utterances.put_nowait(bytes(speech))
+                                pre = []
+
+            async def _brain():
+                async with httpx.AsyncClient(timeout=30) as http:
+                    interrupted.clear()
+                    await _speak(http, first_message, voice, outgoing, interrupted)
+                    history.append({"role": "assistant", "content": first_message})
+                    transcript.append(f"Агент: {first_message}")
+                    while True:
+                        pcm = await utterances.get()
+                        text = await _transcribe(http, pcm)
+                        if not text:
+                            continue
+                        transcript.append(f"Собеседник: {text}")
+                        if history[-1]["role"] == "user":
+                            history[-1]["content"] += " " + text
+                        else:
+                            history.append({"role": "user", "content": text})
+                        if not utterances.empty():
+                            continue  # they kept talking; answer the whole thing
+                        reply = await _think(http, system, history)
+                        done = _TALK_END_MARK in reply
+                        reply = reply.replace(_TALK_END_MARK, "").strip()
+                        history.append({"role": "assistant", "content": reply or "..."})
+                        if reply:
+                            transcript.append(f"Агент: {reply}")
+                            interrupted.clear()
+                            await _speak(http, reply, voice, outgoing, interrupted)
+                        if done:
+                            end_reason["value"] = "agent finished the conversation"
+                            finished.set()
+                            return
+
+            tasks = [asyncio.create_task(c()) for c in (_speaker, _listener, _brain)]
+            waiters = [asyncio.create_task(hung_up.wait()), asyncio.create_task(finished.wait())]
             try:
                 await engine.record(user.id, RecordStream(audio=True, audio_parameters=params))
-                async with websockets.connect(signed_url, max_size=None) as ws:
-                    await ws.send(
-                        _json.dumps(
-                            {
-                                "type": "conversation_initiation_client_data",
-                                "conversation_config_override": {
-                                    "agent": {
-                                        "first_message": first_message,
-                                        "prompt": {"prompt": _talk_prompt(goal)},
-                                    }
-                                },
-                            }
-                        )
-                    )
-
-                    async def _uplink():
-                        # Telegram -> agent, batched to ~100 ms
-                        buf = bytearray()
-                        while True:
-                            buf += await incoming.get()
-                            if len(buf) >= _TALK_FRAME_BYTES * 10:
-                                await ws.send(
-                                    _json.dumps(
-                                        {"user_audio_chunk": base64.b64encode(bytes(buf)).decode()}
-                                    )
-                                )
-                                buf.clear()
-
-                    async def _downlink():
-                        # agent -> buffer; transcripts and control events
-                        async for raw in ws:
-                            msg = _json.loads(raw)
-                            kind = msg.get("type")
-                            if kind == "audio":
-                                outgoing.extend(
-                                    base64.b64decode(msg["audio_event"]["audio_base_64"])
-                                )
-                            elif kind == "interruption":
-                                outgoing.clear()
-                            elif kind == "user_transcript":
-                                text = msg["user_transcription_event"]["user_transcript"]
-                                transcript.append(f"Собеседник: {text}")
-                            elif kind == "agent_response":
-                                text = msg["agent_response_event"]["agent_response"]
-                                transcript.append(f"Агент: {text}")
-                            elif kind == "ping":
-                                await ws.send(
-                                    _json.dumps(
-                                        {"type": "pong", "event_id": msg["ping_event"]["event_id"]}
-                                    )
-                                )
-                        end_reason["value"] = "agent ended the conversation"
-
-                    async def _speaker():
-                        # buffer -> Telegram, paced in real time, 10 ms frames
-                        tick = time.monotonic()
-                        while True:
-                            if len(outgoing) >= _TALK_FRAME_BYTES:
-                                chunk = bytes(outgoing[:_TALK_FRAME_BYTES])
-                                del outgoing[:_TALK_FRAME_BYTES]
-                            else:
-                                chunk = _TALK_SILENCE
-                            await engine.send_frame(user.id, Device.MICROPHONE, chunk)
-                            tick += 0.01
-                            await asyncio.sleep(max(0.0, tick - time.monotonic()))
-
-                    async def _wait_hangup():
-                        await hung_up.wait()
-
-                    tasks = [
-                        asyncio.create_task(t())
-                        for t in (_uplink, _downlink, _speaker, _wait_hangup)
-                    ]
-                    done, pending = await asyncio.wait(
-                        tasks, timeout=max_seconds, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    downlink_task = tasks[1]
-                    if downlink_task in done and not hung_up.is_set():
-                        # let the goodbye phrase finish playing before hanging up
-                        deadline = time.monotonic() + 8
-                        while len(outgoing) >= _TALK_FRAME_BYTES and time.monotonic() < deadline:
-                            await asyncio.sleep(0.1)
-                    for t in tasks:
-                        t.cancel()
-                    for t in done:
-                        if t.exception() and not isinstance(t.exception(), websockets.ConnectionClosed):
-                            end_reason["value"] = f"error: {t.exception()!r}"
+                done_set, _ = await asyncio.wait(
+                    tasks + waiters, timeout=max_seconds, return_when=asyncio.FIRST_COMPLETED
+                )
+                if finished.is_set():
+                    # let the goodbye finish playing
+                    deadline = time.monotonic() + 10
+                    while len(outgoing) >= _TALK_FRAME_BYTES and time.monotonic() < deadline:
+                        await asyncio.sleep(0.1)
+                for t in done_set:
+                    if t in tasks and t.exception():
+                        end_reason["value"] = f"error: {t.exception()!r}"
             finally:
+                for t in tasks + waiters:
+                    t.cancel()
                 try:
                     await engine.leave_call(user.id)
                 except Exception:
@@ -372,17 +477,6 @@ async def talk_call(
             return f"Call to {user.id} ended ({end_reason['value']}, ~{talked}s).\n\n{lines}"
     except Exception as e:
         return log_and_format_error("talk_call", e, user_id=user_id)
-
-
-def _talk_prompt(goal: str) -> str:
-    return (
-        "Ты — голосовой ИИ-помощник Михаила Корогодского и звонишь от его имени по Telegram. "
-        "Говори по-русски, коротко и живо, как в обычном телефонном разговоре: одна-две фразы за раз. "
-        "Если спросят, кто ты, честно скажи, что ты ИИ-помощник Михаила. "
-        "Ничего не обещай от имени Михаила (деньги, сроки, решения) — скажи, что передашь ему. "
-        "Когда цель звонка достигнута или собеседник хочет закончить, вежливо попрощайся и заверши звонок.\n\n"
-        f"Цель этого звонка: {goal}"
-    )
 
 
 __all__ = ["make_call", "talk_call"]

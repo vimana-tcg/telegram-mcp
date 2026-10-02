@@ -8,4 +8,3 @@ qrcode>=8.2
 telethon>=1.45.0
 py-tgcalls[telethon]==3.0.0
 ntgcalls==3.0.0
-websockets>=13,<16
