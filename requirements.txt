@@ -6,3 +6,5 @@ python-dotenv>=1.1.0
 python-json-logger>=3.3.0
 qrcode>=8.2
 telethon>=1.45.0
+py-tgcalls[telethon]==3.0.0
+ntgcalls==3.0.0

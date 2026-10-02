@@ -1,5 +1,5 @@
-# Use an official Python runtime as a parent image (Alpine-based for minimal vulnerabilities)
-FROM python:3.13-alpine
+# Debian slim: ntgcalls (voice calls) ships only glibc manylinux wheels, not musl/Alpine
+FROM python:3.13-slim
 
 # Set the working directory in the container
 WORKDIR /app
@@ -10,7 +10,8 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Install system dependencies if needed (e.g., for certain Python packages)
-# RUN apt-get update && apt-get install -y --no-install-recommends some-package && rm -rf /var/lib/apt/lists/*
+# ffmpeg decodes audio files for make_call
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency definition files
 # If using Poetry:
