@@ -513,3 +513,89 @@ __all__ = [
     "get_bot_info",
     "set_bot_commands",
 ]
+
+
+_STORY_PRIVACY_RULES = {
+    "everyone": lambda: [types.InputPrivacyValueAllowAll()],
+    "contacts": lambda: [types.InputPrivacyValueAllowContacts()],
+    "close_friends": lambda: [types.InputPrivacyValueAllowCloseFriends()],
+}
+_STORY_VIDEO_EXTENSIONS = {".mp4", ".mov"}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Send Story", openWorldHint=True, destructiveHint=True)
+)
+@with_account(readonly=False)
+async def send_story(
+    file_path: str,
+    caption: str = None,
+    privacy: str = "everyone",
+    pinned: bool = False,
+    period_hours: int = 24,
+    video_duration: float = None,
+    video_width: int = 720,
+    video_height: int = 1280,
+    ctx: Optional[Context] = None,
+    account: str = None,
+) -> str:
+    """
+    Post a story to your own profile (photo or vertical video).
+
+    Args:
+        file_path: Photo (.jpg/.jpeg/.png) or video (.mp4/.mov) under allowed roots.
+        caption: Optional story caption.
+        privacy: Who sees it: 'everyone', 'contacts' or 'close_friends'.
+        pinned: Keep the story on the profile after it expires.
+        period_hours: Lifetime in hours: 6, 12, 24 or 48 (anything but 24 needs Premium).
+        video_duration: Video length in seconds (required for videos).
+        video_width: Video width in pixels (videos only).
+        video_height: Video height in pixels (videos only).
+    """
+    try:
+        if privacy not in _STORY_PRIVACY_RULES:
+            return f"Unknown privacy '{privacy}'. Use: {', '.join(_STORY_PRIVACY_RULES)}."
+        if period_hours not in (6, 12, 24, 48):
+            return "period_hours must be 6, 12, 24 or 48."
+        cl = get_client(account)
+        await ensure_connected(cl)
+        safe_path, path_error = await _resolve_readable_file_path(
+            raw_path=file_path,
+            ctx=ctx,
+            tool_name="send_story",
+        )
+        if path_error:
+            return path_error
+
+        uploaded = await cl.upload_file(str(safe_path))
+        if safe_path.suffix.lower() in _STORY_VIDEO_EXTENSIONS:
+            if not video_duration:
+                return "video_duration (seconds) is required for video stories."
+            media = types.InputMediaUploadedDocument(
+                file=uploaded,
+                mime_type="video/mp4",
+                attributes=[
+                    types.DocumentAttributeVideo(
+                        duration=video_duration,
+                        w=video_width,
+                        h=video_height,
+                        supports_streaming=True,
+                    )
+                ],
+            )
+        else:
+            media = types.InputMediaUploadedPhoto(file=uploaded)
+
+        await cl(
+            functions.stories.SendStoryRequest(
+                peer=types.InputPeerSelf(),
+                media=media,
+                privacy_rules=_STORY_PRIVACY_RULES[privacy](),
+                caption=caption or None,
+                pinned=pinned or None,
+                period=None if period_hours == 24 else period_hours * 3600,
+            )
+        )
+        return f"Story posted from {safe_path} (privacy: {privacy}, pinned: {pinned})."
+    except Exception as e:
+        return log_and_format_error("send_story", e, file_path=file_path)
