@@ -500,21 +500,6 @@ async def get_user_status(user_id: Union[int, str], account: str = None) -> str:
         return log_and_format_error("get_user_status", e, user_id=user_id)
 
 
-__all__ = [
-    "get_me",
-    "update_profile",
-    "set_profile_photo",
-    "delete_profile_photo",
-    "get_privacy_settings",
-    "set_privacy_settings",
-    "get_full_user",
-    "get_user_photos",
-    "get_user_status",
-    "get_bot_info",
-    "set_bot_commands",
-]
-
-
 _STORY_PRIVACY_RULES = {
     "everyone": lambda: [types.InputPrivacyValueAllowAll()],
     "contacts": lambda: [types.InputPrivacyValueAllowContacts()],
@@ -599,3 +584,20 @@ async def send_story(
         return f"Story posted from {safe_path} (privacy: {privacy}, pinned: {pinned})."
     except Exception as e:
         return log_and_format_error("send_story", e, file_path=file_path)
+
+
+__all__ = [
+    "get_me",
+    "update_profile",
+    "set_profile_photo",
+    "delete_profile_photo",
+    "get_privacy_settings",
+    "set_privacy_settings",
+    "get_full_user",
+    "get_user_photos",
+    "get_user_status",
+    "get_bot_info",
+    "set_bot_commands",
+    "send_story",
+]
+
