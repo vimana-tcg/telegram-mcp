@@ -10,8 +10,10 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Install system dependencies if needed (e.g., for certain Python packages)
-# ffmpeg decodes audio files for make_call
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+# ffmpeg decodes audio files for make_call; node runs the Claude Code CLI used by talk_call
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg nodejs npm \
+    && npm install -g @anthropic-ai/claude-code@2.1.280 && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency definition files
 # If using Poetry:

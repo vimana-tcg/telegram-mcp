@@ -138,13 +138,14 @@ async def make_call(
 
 
 
-# --- Live two-way conversation: OpenAI ears, Claude brain, ElevenLabs/OpenAI mouth ---
+# --- Live two-way conversation: ElevenLabs ears and mouth, Claude (Claude Code subscription) brain ---
 
 _TALK_RATE = 48000  # call audio: 48 kHz mono s16le
 _TALK_FRAME_BYTES = _TALK_RATE // 100 * 2  # 10 ms
 _TALK_SILENCE = b"\x00" * _TALK_FRAME_BYTES
 _TALK_END_MARK = "[КОНЕЦ]"
-_TALK_MODEL = os.environ.get("TALK_CALL_LLM", "claude-sonnet-5-5")
+_TALK_MODEL = os.environ.get("TALK_CALL_LLM", "sonnet")
+_TALK_ROBOT_VOICE = os.environ.get("ELEVENLABS_ROBOT_VOICE_ID", "pNInz6obpgDQGcFmaJgB")
 
 
 def _rms(pcm: bytes) -> float:
@@ -188,6 +189,7 @@ def _talk_prompt(goal: str) -> str:
         "Если спросят, кто ты, честно скажи, что ты ИИ-помощник Михаила. "
         "Ничего не обещай от имени Михаила (деньги, сроки, решения) — скажи, что передашь ему. "
         "Реплики собеседника приходят из распознавания речи и могут быть с ошибками — понимай по смыслу. "
+        "Самое первое сообщение — техническая проверка до звонка: ответь на него одним словом «готов». "
         f"Когда цель достигнута или собеседник прощается, попрощайся и добавь в самом конце {_TALK_END_MARK}.\n\n"
         f"Цель этого звонка: {goal}"
     )
@@ -195,49 +197,78 @@ def _talk_prompt(goal: str) -> str:
 
 async def _transcribe(http, pcm: bytes) -> str:
     resp = await http.post(
-        "https://api.openai.com/v1/audio/transcriptions",
-        headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-        data={"model": "gpt-4o-transcribe", "language": "ru"},
+        "https://api.elevenlabs.io/v1/speech-to-text",
+        headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
+        data={"model_id": "scribe_v1", "language_code": "rus", "tag_audio_events": "false"},
         files={"file": ("speech.wav", _wav_bytes(pcm), "audio/wav")},
     )
     resp.raise_for_status()
     return (resp.json().get("text") or "").strip()
 
 
-async def _think(http, system: str, history: list) -> str:
-    resp = await http.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-            "anthropic-version": "2023-06-01",
-        },
-        json={"model": _TALK_MODEL, "max_tokens": 300, "system": system, "messages": history},
-    )
-    resp.raise_for_status()
-    return "".join(b.get("text", "") for b in resp.json().get("content", [])).strip()
+class _ClaudeBrain:
+    """One headless Claude Code session per call; runs on the Claude subscription."""
+
+    def __init__(self, system: str):
+        self.system = system
+        self.proc = None
+        self.ready = None
+
+    async def start(self) -> None:
+        self.proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+            "--verbose", "--model", _TALK_MODEL, "--tools", "", "--strict-mcp-config",
+            "--setting-sources", "", "--no-session-persistence", "--system-prompt", self.system,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, cwd="/tmp",
+            env={**os.environ, "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
+        )
+        # warm up while the phone rings: the first turn pays the startup cost
+        self.ready = asyncio.create_task(self._turn("(техническая проверка связи перед звонком, ответь одним словом: готов)"))
+
+    async def _turn(self, text: str) -> str:
+        import json
+
+        msg = {"type": "user", "message": {"role": "user", "content": text}}
+        self.proc.stdin.write((json.dumps(msg, ensure_ascii=False) + "\n").encode())
+        await self.proc.stdin.drain()
+        while True:
+            line = await self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("claude process exited")
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "result":
+                if event.get("is_error"):
+                    raise RuntimeError(f"claude error: {event.get('result')}")
+                return (event.get("result") or "").strip()
+
+    async def ask(self, text: str) -> str:
+        await self.ready
+        return await self._turn(text)
+
+    async def close(self) -> None:
+        if self.proc and self.proc.returncode is None:
+            self.proc.kill()
+            await self.proc.wait()
 
 
 async def _speak(http, text: str, voice: str, sink, interrupted: asyncio.Event) -> None:
     """Stream TTS (24 kHz PCM) into `sink` as 48 kHz, stopping on barge-in."""
-    if voice == "robot":
-        req = http.stream(
-            "POST",
-            "https://api.openai.com/v1/audio/speech",
-            headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-            json={"model": "gpt-4o-mini-tts", "voice": "onyx", "input": text, "response_format": "pcm"},
-        )
-    else:
-        req = http.stream(
-            "POST",
-            f"https://api.elevenlabs.io/v1/text-to-speech/{os.environ['ELEVENLABS_VOICE_ID']}/stream",
-            params={"output_format": "pcm_24000"},
-            headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
-            json={
-                "text": text,
-                "model_id": "eleven_flash_v2_5",
-                "voice_settings": {"stability": 0.72, "similarity_boost": 0.8, "style": 0.15},
-            },
-        )
+    voice_id = _TALK_ROBOT_VOICE if voice == "robot" else os.environ["ELEVENLABS_VOICE_ID"]
+    req = http.stream(
+        "POST",
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream",
+        params={"output_format": "pcm_24000"},
+        headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
+        json={
+            "text": text,
+            "model_id": "eleven_flash_v2_5",
+            "voice_settings": {"stability": 0.72, "similarity_boost": 0.8, "style": 0.15},
+        },
+    )
     tail = b""
     async with req as resp:
         resp.raise_for_status()
@@ -259,7 +290,7 @@ async def talk_call(
     user_id: Union[int, str],
     goal: str,
     first_message: str = "Алло, привет!",
-    voice: str = "clone",
+    voice: str = "robot",
     ring_timeout: int = 45,
     max_seconds: int = 300,
     account: str = None,
@@ -267,15 +298,17 @@ async def talk_call(
     """
     Call a user and hold a live voice conversation about `goal`.
 
-    Speech recognition: OpenAI. Replies: Claude. Voice: the cloned ElevenLabs
-    voice ("clone") or a stock OpenAI voice ("robot"). Returns the transcript.
+    Speech recognition: ElevenLabs Scribe. Replies: Claude via the Claude Code
+    CLI (subscription token in CLAUDE_CODE_OAUTH_TOKEN). Voice: the cloned
+    ElevenLabs voice ("clone") or a stock ElevenLabs voice ("robot").
+    Returns the transcript.
     Only users listed in TELEGRAM_CALL_ALLOWED_USER_IDS can be called.
 
     Args:
         user_id: Target user id or username.
         goal: Instructions for this call (who is called, what to find out).
         first_message: First phrase said when the user answers.
-        voice: "clone" (founder's cloned voice) or "robot" (stock voice).
+        voice: "robot" (stock voice) or "clone" (founder's cloned voice, paid plan).
         ring_timeout: Seconds to wait for the user to answer (10-90).
         max_seconds: Hard limit on conversation length (30-900).
     """
@@ -301,9 +334,9 @@ async def talk_call(
             return "ring_timeout must be between 10 and 90 seconds."
         if not 30 <= max_seconds <= 900:
             return "max_seconds must be between 30 and 900 seconds."
-        needed = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+        needed = ["ELEVENLABS_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
         if voice == "clone":
-            needed += ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"]
+            needed.append("ELEVENLABS_VOICE_ID")
         missing = [k for k in needed if not os.environ.get(k)]
         if missing:
             return f"Missing env: {', '.join(missing)}"
@@ -344,27 +377,31 @@ async def talk_call(
                 | call_filters.chat_update(ChatUpdate.Status.DISCARDED_CALL)
             )(_on_update)
 
+            brain = _ClaudeBrain(_talk_prompt(goal))
+            await brain.start()
             try:
                 await engine.play(
                     user.id,
                     MediaStream(ExternalMedia.AUDIO, audio_parameters=params),
                     CallConfig(timeout=ring_timeout),
                 )
-            except TimedOutAnswer:
-                return f"No answer from {user.id} within {ring_timeout}s."
-            except CallDeclined:
-                return f"User {user.id} declined the call."
-            except CallBusy:
-                return f"User {user.id} is busy on another call."
-            except CallDiscarded:
-                return f"Call to {user.id} was discarded before it connected."
+            except BaseException as e:
+                await brain.close()
+                if isinstance(e, TimedOutAnswer):
+                    return f"No answer from {user.id} within {ring_timeout}s."
+                if isinstance(e, CallDeclined):
+                    return f"User {user.id} declined the call."
+                if isinstance(e, CallBusy):
+                    return f"User {user.id} is busy on another call."
+                if isinstance(e, CallDiscarded):
+                    return f"Call to {user.id} was discarded before it connected."
+                raise
 
             started = time.monotonic()
             utterances: asyncio.Queue = asyncio.Queue()
             interrupted = asyncio.Event()
             finished = asyncio.Event()
-            system = _talk_prompt(goal)
-            history = [{"role": "user", "content": "(собеседник взял трубку)"}]
+            pending = [f"(собеседник взял трубку, ты уже сказал: «{first_message}»)"]
 
             async def _speaker():
                 # outgoing buffer -> call, paced in real time, 10 ms frames
@@ -417,7 +454,6 @@ async def talk_call(
                 async with httpx.AsyncClient(timeout=30) as http:
                     interrupted.clear()
                     await _speak(http, first_message, voice, outgoing, interrupted)
-                    history.append({"role": "assistant", "content": first_message})
                     transcript.append(f"Агент: {first_message}")
                     while True:
                         pcm = await utterances.get()
@@ -425,16 +461,13 @@ async def talk_call(
                         if not text:
                             continue
                         transcript.append(f"Собеседник: {text}")
-                        if history[-1]["role"] == "user":
-                            history[-1]["content"] += " " + text
-                        else:
-                            history.append({"role": "user", "content": text})
+                        pending.append(text)
                         if not utterances.empty():
                             continue  # they kept talking; answer the whole thing
-                        reply = await _think(http, system, history)
+                        reply = await brain.ask(" ".join(pending))
+                        pending.clear()
                         done = _TALK_END_MARK in reply
                         reply = reply.replace(_TALK_END_MARK, "").strip()
-                        history.append({"role": "assistant", "content": reply or "..."})
                         if reply:
                             transcript.append(f"Агент: {reply}")
                             interrupted.clear()
@@ -462,6 +495,7 @@ async def talk_call(
             finally:
                 for t in tasks + waiters:
                     t.cancel()
+                await brain.close()
                 try:
                     await engine.leave_call(user.id)
                 except Exception:
