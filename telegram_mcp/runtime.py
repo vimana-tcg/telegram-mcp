@@ -859,7 +859,8 @@ _DEFAULT_EXTENSION_ALLOWLISTS: dict[str, set[str]] = {
 # keeps today's behaviour.
 EXTENSION_ALLOWLISTS: dict[str, set[str]] = dict(_DEFAULT_EXTENSION_ALLOWLISTS)
 MAX_FILE_BYTES: dict[str, int] = {
-    "download_media": 200 * 1024 * 1024,  # 200 MB
+    # TELEGRAM_MAX_DOWNLOAD_MB raises it (Telegram itself caps files at 2000 MB).
+    "download_media": int(os.getenv("TELEGRAM_MAX_DOWNLOAD_MB", "200")) * 1024 * 1024,
     "send_file": 200 * 1024 * 1024,  # 200 MB
     "upload_file": 200 * 1024 * 1024,
     "send_voice": 100 * 1024 * 1024,
