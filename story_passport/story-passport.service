@@ -1,0 +1,13 @@
+[Unit]
+Description=Story -> passport auto-responder (@godskyiflow)
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStart=/opt/story-passport/story_passport/run.sh
+ExecStop=/usr/bin/docker stop story-passport
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
