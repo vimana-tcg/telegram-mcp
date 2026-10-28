@@ -10,6 +10,7 @@ same session is also used by several telegram-mcp containers at once.
 import asyncio, json, os, re, time
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.functions.stories import GetStoriesByIDRequest
 from telethon.tl.types import MessageReplyStoryHeader, User
 
 CFG = os.environ.get("SP_CONFIG", "/app/config.json")
@@ -32,12 +33,25 @@ def save(state):
     os.replace(tmp, STATE)
 
 
+async def story_key(c, sid, cfg, state):
+    """Product for one of our stories: config ids first, else match by the story caption."""
+    known = state.setdefault("story_map", {})
+    key = cfg["stories"].get(str(sid)) or known.get(str(sid))
+    if key:
+        return key
+    r = await c(GetStoriesByIDRequest(peer="me", id=[sid]))
+    cap = next((getattr(s, "caption", None) or "" for s in r.stories), "")
+    key = next((k for k, p in cfg["products"].items() if p.get("match") and p["match"] in cap), None)
+    if key:
+        known[str(sid)] = key
+    return key
+
+
 def has_code(text, code):
     return re.search(r"(?<!\d)" + re.escape(code) + r"(?!\d)", text or "") is not None
 
 
 async def tick(c, me_id, cfg, state):
-    stories = cfg["stories"]  # {"<story_id>": "<product key>"}
     since = state.get("since", time.time() - 3600)
     newest = since
     async for d in c.iter_dialogs(limit=cfg.get("dialogs", 40)):
@@ -57,7 +71,7 @@ async def tick(c, me_id, cfg, state):
                 continue
             if getattr(r.peer, "user_id", me_id) != me_id:
                 continue
-            key = stories.get(str(r.story_id))
+            key = await story_key(c, r.story_id, cfg, state)
             if not key:
                 continue
             p = cfg["products"][key]
